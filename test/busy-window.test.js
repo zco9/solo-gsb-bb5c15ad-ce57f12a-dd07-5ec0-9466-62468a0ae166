@@ -1,0 +1,309 @@
+'use strict';
+
+/* 人员交接忙时排查引擎单元测试：node test/busy-window.test.js */
+
+const assert = require('assert');
+const { investigateBusyWindow, WINDOW_STATUS } = require('../src/busy-window');
+const { WAREHOUSE } = require('../src/verify');
+
+let seq = 0;
+const t = (n) => 1000 + n;
+
+function mkData(props, records) {
+  return {
+    props: props.map((name, i) => ({ id: `p${i}`, name, note: '', createdAt: t(seq++) })),
+    records,
+  };
+}
+function rec(propId, minute, from, to) {
+  return { id: `r${seq++}`, propId, minute, from, to, note: '', createdAt: t(seq) };
+}
+
+let passed = 0;
+function test(name, fn) {
+  seq = 0;
+  fn();
+  passed += 1;
+  console.log(`  ✓ ${name}`);
+}
+
+// 1. 基本计数：半开窗口边界（起点计入、末端不计），相邻同结论起点合并，等于上限不算超限
+test('忙时排查：半开窗口逐起点计数，相邻同结论起点合并，等于上限不算', () => {
+  const data = mkData(['剑'], [
+    rec('p0', 0, WAREHOUSE, '张三'),
+    rec('p0', 3, '张三', '李四'),
+    rec('p0', 5, '李四', '张三'),
+    rec('p0', 9, '张三', WAREHOUSE),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 6, 3, 1);
+  // 张三已确认分钟：0(接)、3(交)、5(接)；9 超出最后一个窗口覆盖分钟（8）不参与
+  // s=0 [0,3):{0}=1 OK；s=1 [1,4):{3}=1 OK；s=2 [2,5):{3}=1 OK；
+  // s=3 [3,6):{3,5}=2 超限；s=4 [4,7):{5}=1 OK；s=5 {5}=1 OK；s=6 {}=0 OK
+  assert.strictEqual(r.overSegments.length, 1);
+  const seg = r.overSegments[0];
+  assert.strictEqual(seg.firstStart, 3);
+  assert.strictEqual(seg.lastStart, 3);
+  assert.strictEqual(seg.coverEndMinute, 5);
+  assert.strictEqual(seg.peakKnownCount, 2);
+  assert.deepStrictEqual(seg.records.map((x) => x.minute), [3, 5]);
+  assert.deepStrictEqual(seg.records.map((x) => x.role), ['from', 'to']);
+  assert.strictEqual(seg.conflicts.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 0);
+  assert.strictEqual(r.conflicts.length, 0);
+  // 已知峰值 2 次，出现于起点第 3 分
+  assert.strictEqual(r.peak.count, 2);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 3, lastStart: 3 }]);
+  // 涉及记录为超限段计入的记录并集
+  assert.deepStrictEqual(r.involvedRecords.map((x) => x.minute), [3, 5]);
+  assert.strictEqual(r.summary.windowCount, 7);
+  assert.strictEqual(r.summary.hasOver, true);
+  assert.strictEqual(r.summary.involvedRecordCount, 2);
+});
+
+// 2. 同分钟链式交接按实际可接续记录逐条计数，录入顺序不影响结果
+test('忙时排查：同分钟链式交接逐条计数，录入顺序不影响', () => {
+  // 按与链相反的顺序录入：李四→王五、张三→李四、仓库→张三（同为第 3 分钟）
+  const data = mkData(['剑'], [
+    rec('p0', 3, '李四', '王五'),
+    rec('p0', 3, '张三', '李四'),
+    rec('p0', 3, WAREHOUSE, '张三'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 3, 3, 1, 1);
+  // 张三在第 3 分钟链接收 1 次、交出 1 次，共 2 次 > 上限 1
+  assert.strictEqual(r.overSegments.length, 1);
+  assert.strictEqual(r.overSegments[0].peakKnownCount, 2);
+  assert.deepStrictEqual(
+    r.overSegments[0].records.map((x) => x.role).sort(),
+    ['from', 'to']
+  );
+  assert.strictEqual(r.peak.count, 2);
+
+  // 同样的记录按链顺序录入，结果完全一致
+  seq = 0;
+  const data2 = mkData(['剑'], [
+    rec('p0', 3, WAREHOUSE, '张三'),
+    rec('p0', 3, '张三', '李四'),
+    rec('p0', 3, '李四', '王五'),
+  ]);
+  const r2 = investigateBusyWindow(data2, '张三', 3, 3, 1, 1);
+  assert.strictEqual(r2.overSegments.length, 1);
+  assert.strictEqual(r2.overSegments[0].peakKnownCount, 2);
+  assert.strictEqual(r2.peak.count, 2);
+
+  // 李四同样参与 2 次，王五只参与 1 次（等于上限不算超限）
+  const r3 = investigateBusyWindow(data2, '王五', 3, 3, 1, 1);
+  assert.strictEqual(r3.overSegments.length, 0);
+  assert.strictEqual(r3.peak.count, 1);
+});
+
+// 3. 已知次数等于上限不算超限
+test('忙时排查：已知次数等于上限不算超限', () => {
+  const data = mkData(['剑'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 2, '张三', '李四'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 2, 3, 2);
+  // 每个窗口都含第 1、2 分钟两条记录 = 2 次，等于上限不算超限
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 0);
+  assert.strictEqual(r.peak.count, 2);
+  assert.strictEqual(r.summary.hasOver, false);
+});
+
+// 4. 冲突前已确认的记录继续计入；窗口未伸入冲突分钟时完全确定，伸入后无法判定
+test('忙时排查：冲突前已确认记录继续计入，窗口伸入冲突分钟后无法判定', () => {
+  const data = mkData(['扇'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '王五'), // 歧义：同一分钟两条可接续
+    rec('p0', 5, '张三', '赵六'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 4, 2, 0);
+  // s=0 [0,2):{1}=1 超限（确定）；s=1 [1,3):{1}=1 超限；s=2 [2,4):0 OK；
+  // s=3 [3,5):0（窗口末端 5 未覆盖冲突分钟 5）OK；s=4 [4,6):0 但覆盖冲突分钟 -> 无法判定
+  assert.strictEqual(r.overSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.overSegments[0].firstStart, r.overSegments[0].lastStart, r.overSegments[0].peakKnownCount],
+    [0, 1, 1]
+  );
+  assert.deepStrictEqual(r.overSegments[0].records.map((x) => x.minute), [1]);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  const u = r.undeterminedSegments[0];
+  assert.strictEqual(u.firstStart, 4);
+  assert.strictEqual(u.lastStart, 4);
+  assert.strictEqual(u.maxKnownCount, 0);
+  assert.deepStrictEqual(
+    u.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['扇', 5, 'AMBIGUOUS']]
+  );
+  assert.strictEqual(r.conflicts.length, 1);
+  assert.strictEqual(r.peak.count, 1);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 1 }]);
+});
+
+// 5. 窗口伸入冲突分钟及以后时，已知次数超上限仍判确定超限（段内标注冲突道具）
+test('忙时排查：窗口伸入冲突后已知次数仍超上限 -> 确定超限并标注冲突道具', () => {
+  const data = mkData(['剑', '扇'], [
+    rec('p0', 0, WAREHOUSE, '张三'),
+    rec('p0', 2, '张三', '李四'),
+    rec('p1', 1, WAREHOUSE, '王五'),
+    rec('p1', 4, '王五', '赵六'), // 歧义
+    rec('p1', 4, '王五', '钱七'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 3, 4, 0);
+  // 张三已确认：0、2。s=0 [0,4):2 超限（未触冲突）；s=1 [1,5):1 超限（触及扇@4）；
+  // s=2 [2,6):1 超限（触及）；s=3 [3,7):0 -> 无法判定
+  assert.strictEqual(r.overSegments.length, 1);
+  const seg = r.overSegments[0];
+  assert.deepStrictEqual([seg.firstStart, seg.lastStart, seg.peakKnownCount], [0, 2, 2]);
+  assert.deepStrictEqual(seg.records.map((x) => x.minute), [0, 2]);
+  assert.deepStrictEqual(
+    seg.conflicts.map((c) => [c.propName, c.conflictMinute]),
+    [['扇', 4]]
+  );
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.undeterminedSegments[0].firstStart, r.undeterminedSegments[0].lastStart],
+    [3, 3]
+  );
+});
+
+// 6. 断链冲突同样处理：冲突前记录计入，伸入冲突分钟后无法判定
+test('忙时排查：断链冲突前记录计入，窗口伸入冲突分钟后无法判定', () => {
+  const data = mkData(['灯'], [
+    rec('p0', 2, WAREHOUSE, '王五'),
+    rec('p0', 4, '李四', '钱七'), // 断链：当前为王五
+  ]);
+  const r = investigateBusyWindow(data, '王五', 0, 5, 3, 0);
+  // s=0 [0,3):{2}=1 超限；s=1 [1,4):{2}=1 超限；s=2 [2,5):{2}=1 超限（触及冲突仍超限）；
+  // s=3..5: 0 -> 无法判定
+  assert.strictEqual(r.overSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.overSegments[0].firstStart, r.overSegments[0].lastStart, r.overSegments[0].peakKnownCount],
+    [0, 2, 1]
+  );
+  assert.deepStrictEqual(
+    r.overSegments[0].conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['灯', 4, 'BROKEN']]
+  );
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.undeterminedSegments[0].firstStart, r.undeterminedSegments[0].lastStart],
+    [3, 5]
+  );
+  assert.strictEqual(r.conflicts[0].conflictType, 'BROKEN');
+});
+
+// 7. 窗口末端之后的冲突不影响结果（更晚的冲突不参与）
+test('忙时排查：窗口覆盖范围之外的更晚冲突不影响结果', () => {
+  const data = mkData(['扇'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 20, '张三', '王五'), // 更晚的歧义冲突
+    rec('p0', 20, '张三', '赵六'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 3, 2, 0);
+  // 最后一个窗口 [3,5)，只重放第 4 分钟及以前的记录：冲突@20 不参与
+  assert.strictEqual(r.conflicts.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 0);
+  assert.strictEqual(r.overSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.overSegments[0].firstStart, r.overSegments[0].lastStart],
+    [0, 1]
+  );
+
+  // 结束分钟扩到 20：冲突参与，起点 19、20 的窗口无法判定
+  const r2 = investigateBusyWindow(data, '张三', 0, 20, 2, 0);
+  assert.strictEqual(r2.conflicts.length, 1);
+  assert.strictEqual(r2.undeterminedSegments.length, 1);
+  assert.deepStrictEqual(
+    [r2.undeterminedSegments[0].firstStart, r2.undeterminedSegments[0].lastStart],
+    [19, 20]
+  );
+});
+
+// 8. 已知峰值：取各起点已知次数最大值，达到峰值的相邻起点分别合并
+test('忙时排查：已知峰值及达到峰值的多个起点段', () => {
+  const data = mkData(['剑', '扇', '灯'], [
+    rec('p0', 0, WAREHOUSE, '张三'),
+    rec('p0', 3, '张三', WAREHOUSE),
+    rec('p0', 10, WAREHOUSE, '张三'),
+    rec('p0', 13, '张三', WAREHOUSE),
+    rec('p1', 1, WAREHOUSE, '张三'),
+    rec('p1', 4, '张三', WAREHOUSE),
+    rec('p1', 11, WAREHOUSE, '张三'),
+    rec('p1', 14, '张三', WAREHOUSE),
+    rec('p2', 2, WAREHOUSE, '张三'),
+    rec('p2', 5, '张三', WAREHOUSE),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 12, 2, 99);
+  // s=0..4 各 2 次（合并为一段），s=10 为 2 次（独立一段），其余更低
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.peak.count, 2);
+  assert.deepStrictEqual(r.peak.segments, [
+    { firstStart: 0, lastStart: 4 },
+    { firstStart: 10, lastStart: 10 },
+  ]);
+});
+
+// 9. 人员未参与：峰值 0，无超限、无无法判定
+test('忙时排查：人员未参与时峰值 0 且无超限', () => {
+  const data = mkData(['剑'], [rec('p0', 0, WAREHOUSE, '李四')]);
+  const r = investigateBusyWindow(data, '张三', 0, 5, 2, 1);
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 0);
+  assert.strictEqual(r.peak.count, 0);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 5 }]);
+  assert.strictEqual(r.involvedRecords.length, 0);
+  assert.strictEqual(r.summary.hasOver, false);
+});
+
+// 10. 多冲突道具：无法判定段内分别标注并按冲突分钟排序
+test('忙时排查：多冲突道具在无法判定段内分别标注并排序', () => {
+  const data = mkData(['扇', '灯'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '王五'), // 歧义@5
+    rec('p0', 5, '张三', '赵六'),
+    rec('p1', 2, WAREHOUSE, '李四'),
+    rec('p1', 3, '王五', '钱七'), // 断链@3
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 6, 2, 5);
+  // s=0 [0,2):{1}=1 OK；s=1 [1,3):{1}=1 OK；s=2..6 均触及冲突 -> 一段无法判定
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  const u = r.undeterminedSegments[0];
+  assert.deepStrictEqual([u.firstStart, u.lastStart], [2, 6]);
+  assert.deepStrictEqual(
+    u.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['灯', 3, 'BROKEN'], ['扇', 5, 'AMBIGUOUS']]
+  );
+  assert.deepStrictEqual(
+    r.conflicts.map((c) => [c.propName, c.conflictMinute]),
+    [['灯', 3], ['扇', 5]]
+  );
+  assert.strictEqual(r.peak.count, 1);
+});
+
+// 11. 不相邻的同结论起点不合并：被确定未超限起点隔开的两段超限
+test('忙时排查：被其他结论隔开的同结论起点不合并', () => {
+  const data = mkData(['剑'], [
+    rec('p0', 0, WAREHOUSE, '张三'),
+    rec('p0', 1, '张三', WAREHOUSE),
+    rec('p0', 10, WAREHOUSE, '张三'),
+    rec('p0', 11, '张三', WAREHOUSE),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 10, 2, 0);
+  // s=0 [0,2):{0,1}=2 超限；s=1 [1,3):{1}=1 超限；s=2..8: 0 OK；
+  // s=9 [9,11):{10}=1 超限；s=10 [10,12):{10,11}=2 超限
+  assert.strictEqual(r.overSegments.length, 2);
+  assert.deepStrictEqual(
+    r.overSegments.map((s) => [s.firstStart, s.lastStart, s.peakKnownCount]),
+    [[0, 1, 2], [9, 10, 2]]
+  );
+  assert.deepStrictEqual(r.overSegments[1].records.map((x) => x.minute), [10, 11]);
+  assert.strictEqual(r.peak.count, 2);
+  assert.deepStrictEqual(r.peak.segments, [
+    { firstStart: 0, lastStart: 0 },
+    { firstStart: 10, lastStart: 10 },
+  ]);
+});
+
+console.log(`\n全部 ${passed} 个交接忙时排查引擎测试通过 ✔`);
