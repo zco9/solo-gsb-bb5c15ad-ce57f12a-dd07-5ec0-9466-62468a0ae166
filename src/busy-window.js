@@ -17,6 +17,12 @@
  *   已超的次数变少），否则标为「无法判定」（不把冲突后的记录当作零）。
  * - 相邻同结论的窗口起点合并为起点段；返回已知峰值（各起点已知次数的
  *   最大值及达到峰值的起点段）、确定超限段涉及的记录与冲突道具清单。
+ *
+ * 大跨度查询不逐起点存储窗口、也不按跨度展开任何数组：已知次数是 s 的分段
+ * 常值函数——一条第 m 分钟的已确认记录恰在起点区间 [m-窗口长度+1, m] 内被
+ * 窗口覆盖（进入点 +1 / 离开点 -1），一个第 c 分钟的冲突恰在起点
+ * c-窗口长度+1（含）以后被窗口末端触达。只扫描这些事件点即可把起点范围
+ * 切成「已知次数、触达冲突数均不变」的起点段，再直接合并同结论段、求峰值段。
  */
 
 const { WAREHOUSE, sortRecords, replayPropRecords } = require('./verify');
@@ -108,36 +114,90 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
   confirmed.sort(recordCmp);
   conflicts.sort(conflictCmp);
 
-  // 逐整数起点求值：半开窗口 [s, s+windowLength)
-  const windows = [];
-  let peakCount = 0;
-  for (let s = startMinute; s <= endMinute; s += 1) {
-    const wEnd = s + windowLength; // 窗口末端（半开，不含）
-    const knownCount = confirmed.reduce(
-      (n, r) => n + (r.minute >= s && r.minute < wEnd ? 1 : 0),
-      0
-    );
-    // 窗口末端到达冲突分钟及以后：窗口覆盖冲突分钟或更晚（s+窗口长度 > 冲突分钟）
-    const reached = conflicts.filter((c) => c.conflictMinute < wEnd);
-    const status =
-      knownCount > limit
-        ? WINDOW_STATUS.OVER
-        : reached.length > 0
-          ? WINDOW_STATUS.UNDETERMINED
-          : WINDOW_STATUS.OK;
-    if (knownCount > peakCount) peakCount = knownCount;
-    windows.push({ start: s, end: wEnd, knownCount, status, reached });
+  // 事件扫描（不按跨度存储窗口、不展开起点数组）：
+  // - 第 m 分钟的已确认记录被窗口 [s, s+W) 覆盖 ⇔ s ≤ m < s+W ⇔ s ∈ [m-W+1, m]：
+  //   起点到达进入点时已知次数 +1，离开覆盖区间的下一个起点时 -1；
+  // - 第 c 分钟的冲突被窗口末端触达 ⇔ s+W > c ⇔ s ≥ c-W+1：起点越过该阈值后
+  //   触达冲突数 +1（触达集合随 s 单调不减，无需离开事件）。
+  // 事件只与记录 / 冲突数量有关，与起点跨度无关。
+  const enters = new Map(); // 起点坐标 -> 已知次数增量（+1 / -1）
+  const thresholds = new Set(); // 起点坐标 -> 触达冲突数 +1
+
+  for (const r of confirmed) {
+    const firstStart = Math.max(startMinute, r.minute - windowLength + 1);
+    const lastStart = Math.min(endMinute, r.minute);
+    if (firstStart > lastStart) continue; // 覆盖区间与查询起点范围不相交
+    enters.set(firstStart, (enters.get(firstStart) || 0) + 1);
+    enters.set(lastStart + 1, (enters.get(lastStart + 1) || 0) - 1);
   }
 
-  // 合并相邻同结论窗口起点（起点逐分钟连续，同结论即并入同一段）
-  const segments = [];
-  for (const w of windows) {
-    const last = segments[segments.length - 1];
-    if (last && last.status === w.status) {
-      last.lastStart = w.start;
-      last.windows.push(w);
+  for (const c of conflicts) {
+    const firstReach = Math.max(startMinute, c.conflictMinute - windowLength + 1);
+    if (firstReach <= endMinute) thresholds.add(firstReach);
+  }
+
+  // 全部事件坐标（含查询起点，保证无事件时也有整段），逐点扫描得到
+  // 「已知次数、触达冲突数均不变」的起点常值段
+  const coords = new Set([startMinute, ...enters.keys(), ...thresholds]);
+  const sortedCoords = [...coords].filter((x) => x <= endMinute + 1).sort((a, b) => a - b);
+
+  const runs = []; // {firstStart, lastStart, knownCount, reachedCount}
+  let knownCount = 0;
+  let reachedCount = 0;
+
+  for (let i = 0; i < sortedCoords.length; i += 1) {
+    const x = sortedCoords[i];
+    if (x > endMinute) break; // 离开事件落在末起点之后：只用于收尾，不形成起点
+    knownCount += enters.get(x) || 0;
+    if (thresholds.has(x)) reachedCount += 1;
+
+    const nextCoord = i + 1 < sortedCoords.length ? sortedCoords[i + 1] : endMinute + 1;
+    const lastStart = Math.min(nextCoord - 1, endMinute);
+    if (x >= startMinute && x <= lastStart) {
+      runs.push({ firstStart: x, lastStart, knownCount, reachedCount });
+    }
+  }
+
+  const runStatus = (run) =>
+    run.knownCount > limit
+      ? WINDOW_STATUS.OVER
+      : run.reachedCount > 0
+        ? WINDOW_STATUS.UNDETERMINED
+        : WINDOW_STATUS.OK;
+
+  // 合并相邻同结论常值段为起点段（段内记录与冲突仍取并集）
+  const statusSegments = [];
+  for (const run of runs) {
+    const status = runStatus(run);
+    const last = statusSegments[statusSegments.length - 1];
+    if (last && last.status === status) {
+      last.lastStart = run.lastStart;
+      last.peakKnownCount = Math.max(last.peakKnownCount, run.knownCount);
     } else {
-      segments.push({ status: w.status, firstStart: w.start, lastStart: w.start, windows: [w] });
+      statusSegments.push({
+        status,
+        firstStart: run.firstStart,
+        lastStart: run.lastStart,
+        peakKnownCount: run.knownCount,
+      });
+    }
+  }
+
+  // 已知峰值：各起点已知次数的最大值（事件扫描下随常值段取最大值即可）
+  let peakCount = 0;
+  for (const run of runs) {
+    if (run.knownCount > peakCount) peakCount = run.knownCount;
+  }
+
+  // 达到峰值的相邻起点段（只看次数是否相邻相等，可跨越不同结论段）
+  const peakSegments = [];
+  for (const run of runs) {
+    if (run.knownCount !== peakCount) continue;
+    const last = peakSegments[peakSegments.length - 1];
+    if (last && last.lastStart === run.firstStart - 1) {
+      last.lastStart = run.lastStart;
+    } else {
+      peakSegments.push({ firstStart: run.firstStart, lastStart: run.lastStart });
     }
   }
 
@@ -151,17 +211,16 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
   const overSegments = [];
   const undeterminedSegments = [];
 
-  for (const seg of segments) {
+  for (const seg of statusSegments) {
     if (seg.status === WINDOW_STATUS.OK) continue;
-    const segPeak = Math.max(...seg.windows.map((w) => w.knownCount));
+    const segPeak = seg.peakKnownCount;
     // 段内各窗口的并集覆盖分钟 [firstStart, lastStart+windowLength)
     const coverEnd = seg.lastStart + windowLength;
-    // 段内触达的冲突道具并集（按冲突分钟、道具名排序）
-    const reachedMap = new Map();
-    for (const w of seg.windows) {
-      for (const c of w.reached) reachedMap.set(c.propId, c);
-    }
-    const segConflicts = [...reachedMap.values()].map(conflictBrief).sort(conflictCmp);
+    // 段内触达冲突随起点单调增多：并集 = 段内最后一个窗口触达的冲突
+    const segConflicts = conflicts
+      .filter((c) => c.conflictMinute < coverEnd)
+      .map(conflictBrief)
+      .sort(conflictCmp);
     const conflictNames = segConflicts
       .map((c) => `「${c.propName}」自第${c.conflictMinute}分`)
       .join('、');
@@ -204,18 +263,6 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
     }
   }
 
-  // 已知峰值：各起点已知次数的最大值，及达到峰值的相邻起点段
-  const peakSegments = [];
-  for (const w of windows) {
-    if (w.knownCount !== peakCount) continue;
-    const last = peakSegments[peakSegments.length - 1];
-    if (last && last.lastStart === w.start - 1) {
-      last.lastStart = w.start;
-    } else {
-      peakSegments.push({ firstStart: w.start, lastStart: w.start });
-    }
-  }
-
   // 涉及记录：确定超限段计入的已确认记录并集（按分钟、道具名、记录编号排序）
   const involvedMap = new Map();
   for (const seg of overSegments) {
@@ -237,7 +284,7 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
     conflicts,
     summary: {
       totalProps: props.length,
-      windowCount: windows.length,
+      windowCount: endMinute - startMinute + 1,
       overSegmentCount: overSegments.length,
       undeterminedSegmentCount: undeterminedSegments.length,
       peakCount,

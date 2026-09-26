@@ -306,4 +306,56 @@ test('忙时排查：被其他结论隔开的同结论起点不合并', () => {
   ]);
 });
 
+// 12. 大跨度查询不逐起点存储/展开窗口：事件扫描直接形成同结论起点段与峰值起点段
+test('忙时排查：大跨度查询不展开起点数组，直接形成确定超限段（峰值 1）', () => {
+  // 一件道具在第 150000 分钟交给张三：起点 0～150000、窗口 150001、上限 0
+  const data = mkData(['令'], [
+    rec('p0', 150000, WAREHOUSE, '张三'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 150000, 150001, 0);
+  // 每个起点的窗口 [s, s+150001) 都覆盖第 150000 分钟的交接：一整段确定超限
+  assert.strictEqual(r.overSegments.length, 1);
+  const seg = r.overSegments[0];
+  assert.deepStrictEqual([seg.firstStart, seg.lastStart, seg.peakKnownCount], [0, 150000, 1]);
+  assert.deepStrictEqual(seg.records.map((x) => x.minute), [150000]);
+  assert.strictEqual(seg.conflicts.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 0);
+  assert.strictEqual(r.peak.count, 1);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 150000 }]);
+  assert.deepStrictEqual(r.involvedRecords.map((x) => x.minute), [150000]);
+  assert.strictEqual(r.summary.windowCount, 150001);
+
+  // 大跨度 + 小窗口：进入/离开事件仍在正确的起点切段（第 149991–150000 个起点覆盖交接）
+  const r2 = investigateBusyWindow(data, '张三', 0, 150000, 10, 0);
+  assert.strictEqual(r2.overSegments.length, 1);
+  assert.deepStrictEqual(
+    [r2.overSegments[0].firstStart, r2.overSegments[0].lastStart],
+    [149991, 150000]
+  );
+  assert.strictEqual(r2.peak.count, 1);
+  assert.deepStrictEqual(r2.peak.segments, [{ firstStart: 149991, lastStart: 150000 }]);
+});
+
+// 13. 大跨度下冲突触达阈值同样按事件扫描：伸入冲突的起点段无法判定，其余确定未超限
+test('忙时排查：大跨度查询冲突触达阈值按事件切段', () => {
+  const data = mkData(['扇'], [
+    rec('p0', 150000, '张三', '王五'), // 歧义：当前为仓库，两条均无法接续 -> BROKEN@150000
+    rec('p0', 150000, '张三', '赵六'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 0, 150000, 10, 0);
+  // 张三无冲突前已确认记录；窗口末端越过冲突分钟 150000 的起点（s ≥ 149991）无法判定
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  const u = r.undeterminedSegments[0];
+  assert.deepStrictEqual([u.firstStart, u.lastStart, u.maxKnownCount], [149991, 150000, 0]);
+  assert.deepStrictEqual(
+    u.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['扇', 150000, 'BROKEN']]
+  );
+  assert.strictEqual(r.peak.count, 0);
+  // 峰值段只按「次数相邻相等」合并，可跨越不同结论段：全体起点已知次数均为 0
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 150000 }]);
+  assert.strictEqual(r.summary.windowCount, 150001);
+});
+
 console.log(`\n全部 ${passed} 个交接忙时排查引擎测试通过 ✔`);

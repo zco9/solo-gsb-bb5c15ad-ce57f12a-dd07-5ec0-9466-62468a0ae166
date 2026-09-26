@@ -44,9 +44,6 @@ async function main() {
   // 折扇：仓库@1→张三，第5分多条可接续冲突（张三已确认分钟 1；第5分两条记录无法确认）
   // 宫灯：仓库@2→王五，第4分断链冲突（王五已确认分钟 2）
   // 御印：仓库@1→周八@6→孙七
-  const state0 = (await api('/api/state')).body;
-  const rev0 = state0.rev;
-  const count0 = state0.records.length;
 
   // 1. 正常查询：超限段 / 无法判定段 / 峰值 / 涉及记录 / 冲突分组齐备
   await test('忙时排查：超限段 / 无法判定段 / 峰值 / 涉及记录 / 冲突完整返回', async () => {
@@ -171,16 +168,45 @@ async function main() {
     );
   });
 
-  // 6. 只读：查询不改写数据（版本号与记录数不变）
-  await test('忙时排查：查询只读，数据版本与记录数不变', async () => {
-    await api('/api/busy-window?person=张三&start=0&end=12&window=3&limit=1');
-    await api('/api/busy-window?person=仓库&start=0&end=30&window=5&limit=0');
-    const after = (await api('/api/state')).body;
-    assert.strictEqual(after.rev, rev0);
-    assert.strictEqual(after.records.length, count0);
+  // 6. 大跨度查询不逐起点存储/展开窗口：道具第 150000 分钟交给新人员，
+  //    起点 0～150000、窗口 150001、上限 0 应正常返回一个确定超限段（峰值 1）
+  await test('忙时排查：大跨度查询不展开参数，返回确定超限段', async () => {
+    const prop = (await api('/api/props', {
+      method: 'POST',
+      body: JSON.stringify({ name: '大跨度令牌' }),
+    })).body;
+    const add = await api('/api/records', {
+      method: 'POST',
+      body: JSON.stringify({ propId: prop.id, minute: 150000, from: '仓库', to: '跨度员' }),
+    });
+    assert.strictEqual(add.status, 201);
+
+    const r = (await api('/api/busy-window?person=跨度员&start=0&end=150000&window=150001&limit=0')).body;
+    assert.strictEqual(r.overSegments.length, 1);
+    const seg = r.overSegments[0];
+    assert.deepStrictEqual([seg.firstStart, seg.lastStart, seg.peakKnownCount], [0, 150000, 1]);
+    assert.deepStrictEqual(
+      seg.records.map((x) => [x.propName, x.minute, x.role]),
+      [['大跨度令牌', 150000, 'to']]
+    );
+    assert.strictEqual(r.undeterminedSegments.length, 0);
+    assert.strictEqual(r.peak.count, 1);
+    assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 150000 }]);
+    assert.strictEqual(r.summary.windowCount, 150001);
   });
 
-  // 7. 参数校验：缺参数 / 负数 / 小数 / 起止颠倒 / 窗口长度不足 1 均 400
+  // 7. 只读：查询不改写数据（版本号与记录数不变）
+  await test('忙时排查：查询只读，数据版本与记录数不变', async () => {
+    const before = (await api('/api/state')).body;
+    await api('/api/busy-window?person=张三&start=0&end=12&window=3&limit=1');
+    await api('/api/busy-window?person=仓库&start=0&end=30&window=5&limit=0');
+    await api('/api/busy-window?person=跨度员&start=0&end=150000&window=150001&limit=0');
+    const after = (await api('/api/state')).body;
+    assert.strictEqual(after.rev, before.rev);
+    assert.strictEqual(after.records.length, before.records.length);
+  });
+
+  // 8. 参数校验：缺参数 / 负数 / 小数 / 起止颠倒 / 窗口长度不足 1 均 400
   await test('忙时排查：参数校验 400', async () => {
     let res = await api('/api/busy-window?start=0&end=12&window=3&limit=1');
     assert.strictEqual(res.status, 400);
