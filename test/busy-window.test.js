@@ -306,4 +306,25 @@ test('忙时排查：被其他结论隔开的同结论起点不合并', () => {
   ]);
 });
 
+// 12. 大跨度查询：不按跨度展开窗口，起点 0～150000、窗口 150001 分钟直接扫描出结论段
+test('忙时排查：大跨度查询不展开窗口，事件扫描直接给出结论段', () => {
+  const data = mkData(['剑'], [rec('p0', 150000, WAREHOUSE, '张三')]);
+  const r = investigateBusyWindow(data, '张三', 0, 150000, 150001, 0);
+  // 每个起点 s ∈ [0,150000] 的半开窗口 [s, s+150001) 都覆盖第 150000 分：
+  // 已知 1 次 > 上限 0，全部确定超限，合并为一段；已知峰值为 1
+  assert.strictEqual(r.overSegments.length, 1);
+  const seg = r.overSegments[0];
+  assert.strictEqual(seg.firstStart, 0);
+  assert.strictEqual(seg.lastStart, 150000);
+  assert.strictEqual(seg.coverEndMinute, 300000);
+  assert.strictEqual(seg.peakKnownCount, 1);
+  assert.deepStrictEqual(seg.records.map((x) => [x.propName, x.minute, x.role]), [['剑', 150000, 'to']]);
+  assert.strictEqual(r.undeterminedSegments.length, 0);
+  assert.strictEqual(r.peak.count, 1);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 150000 }]);
+  assert.strictEqual(r.involvedRecords.length, 1);
+  assert.strictEqual(r.summary.windowCount, 150001);
+  assert.strictEqual(r.summary.hasOver, true);
+});
+
 console.log(`\n全部 ${passed} 个交接忙时排查引擎测试通过 ✔`);
